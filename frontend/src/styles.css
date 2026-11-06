@@ -1,0 +1,142 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  color: var(--ink);
+  background: var(--canvas);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --canvas: #f6f7f5;
+  --surface: #fff;
+  --surface-muted: #eef2ef;
+  --ink: #172622;
+  --muted: #52645f;
+  --border: #dce5e0;
+  --primary: #0f766e;
+  --primary-hover: #0a615a;
+  --primary-soft: #e3f2ed;
+  --danger: #a22a39;
+  --danger-soft: #fcebee;
+  --success: #246749;
+  --success-soft: #e6f4eb;
+  --warning: #80561d;
+  --warning-soft: #fff2d9;
+  --radius: 12px;
+  --shadow: 0 12px 40px rgb(22 46 35 / 9%);
+  --focus: #0f766e;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; min-width: 300px; }
+button, input, textarea, select { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: default; }
+a { color: var(--primary); }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+::selection { background: var(--primary-soft); color: var(--ink); }
+
+.app-shell { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: clamp(20px, 4vw, 52px);
+  padding: 0 24px;
+  min-height: 62px;
+  flex: 0 0 auto;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.app-brand { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.app-brand-mark {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  background: var(--primary);
+  color: #fff;
+}
+.app-brand-name { font-size: 15px; font-weight: 650; letter-spacing: .02em; }
+.app-nav { display: flex; gap: 4px; align-items: center; }
+.app-nav button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 13px;
+  min-height: 40px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.app-nav button[aria-current="page"] { background: var(--primary-soft); color: var(--primary-hover); }
+.app-nav button:hover:not(:disabled):not([aria-current]) { background: var(--surface-muted); color: var(--ink); }
+.app-nav button:disabled { opacity: .5; }
+.app-main { min-height: 0; flex: 1; display: flex; }
+.app-view { min-width: 0; min-height: 0; flex: 1; overflow: auto; }
+.app-view[hidden] { display: none; }
+.app-loading { margin: 48px 24px; color: var(--muted); text-align: center; }
+
+.button, .icon-button {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  color: var(--ink);
+  background: transparent;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+}
+.button { padding: 8px 13px; }
+.icon-button { width: 40px; padding: 0; flex-shrink: 0; }
+.button-primary { color: white; background: var(--primary); }
+.button-secondary { background: var(--surface); border-color: var(--border); }
+.button-danger { color: white; background: var(--danger); }
+.button-primary:hover:not(:disabled) { background: var(--primary-hover); }
+.button-secondary:hover:not(:disabled), .button-ghost:hover:not(:disabled), .icon-button:hover:not(:disabled) { background: var(--surface-muted); }
+.button-danger:hover:not(:disabled) { background: #83212d; }
+.button:disabled, .icon-button:disabled { opacity: .55; }
+
+.field {
+  width: 100%;
+  min-height: 42px;
+  padding: 8px 11px;
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+.field::placeholder { color: var(--muted); }
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: 999px;
+  padding: 4px 9px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+@media (max-width: 560px) {
+  .app-header { min-height: 57px; gap: 10px; padding: 0 12px; justify-content: space-between; }
+  .app-brand { gap: 7px; }
+  .app-brand-mark { width: 30px; height: 30px; }
+  .app-brand-name { font-size: 13px; }
+  .app-nav button { gap: 5px; padding-inline: 9px; }
+}
+
+@media (max-width: 400px) {
+  .app-header { gap: 6px; padding-inline: 8px; }
+  .app-nav button { padding-inline: 5px; }
+  .app-nav button svg { display: none; }
+}

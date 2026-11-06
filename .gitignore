@@ -13,6 +13,13 @@ dist/
 build/
 *.egg-info/
 
+# Frontend
+node_modules/
+*.tsbuildinfo
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
 # data
 data/
 
