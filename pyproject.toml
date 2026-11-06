@@ -20,8 +20,18 @@ dependencies = [
 ]
 
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["config", "streamlit_demo"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src", "src.*"]
+
+[tool.setuptools.package-data]
+"src.prompt" = ["*/prompts.toml", "*/prompt_template/*.md"]
 
 [tool.mongo]
 uri = "mongodb://localhost:27017"

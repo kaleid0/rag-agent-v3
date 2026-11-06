@@ -1,7 +1,7 @@
 from pathlib import Path
 import re
 
-BASE_DIR = Path("src/prompt/")
+BASE_DIR = Path(__file__).resolve().parent
 
 
 def md_to_xml(markdown_text: str) -> str:
