@@ -1,123 +1,110 @@
-from chromadb import Collection, EmbeddingFunction, GetResult, QueryResult
-from langchain_core.documents import Document
-
-# from beanie import PydanticObjectId
-
+import asyncio
+from itertools import chain
 from logging import getLogger
 
-from src.database import get_collection
-from .EmbeddingFunction import EmbeddingFunction, SyncEmbeddingFunction
+from chromadb import Collection, EmbeddingFunction, Embeddings, GetResult, QueryResult
+from chromadb.errors import NotFoundError
+from langchain_core.documents import Document
+
+from src.database import get_chroma_client, get_collection
+from src.rag.utils import query_for_language
+from .EmbeddingFunction import SyncEmbeddingFunction
 
 
 logger = getLogger(__name__)
 
 
 class ChromaRetriever:
-    _instances = {}
-
-    # @property
-    # def name(self) -> str:
-    #     return self.__class__.__name__
-
-    def __new__(cls, collection_record_ids: list[str] | str, *args, **kwargs):
-        if isinstance(collection_record_ids, str):
-            collection_record_ids = [collection_record_ids]
-        key = frozenset(str(i) for i in collection_record_ids)
-        if key not in cls._instances:
-            instance = super().__new__(cls)
-            cls._instances[key] = instance
-        return cls._instances[key]
-
     def __init__(
         self,
         collection_record_ids: list[str] | str,
         language: dict[str, str] | None = None,
-        embedding_function: EmbeddingFunction = SyncEmbeddingFunction(),
+        embedding_function: EmbeddingFunction | None = None,
     ):
-        if getattr(self, "_initialized", False):
-            return
+        self.embedding_function = (
+            embedding_function if embedding_function is not None else SyncEmbeddingFunction()
+        )
+        self.language = language or {}
+        self.vector_stores: dict[str, Collection] = {}
         if isinstance(collection_record_ids, str):
             collection_record_ids = [collection_record_ids]
-        self._initialized = True
-        self.embedding_function = embedding_function
+        if not collection_record_ids:
+            return
 
-        collection_ids = [str(rid) for rid in collection_record_ids]
-        self.vector_stores: dict[str, Collection] = {}
-        self.language: dict[str, str] = {}
-        for cid in collection_ids:
-            self.vector_stores[cid] = get_collection(
-                cid, embedding_function=embedding_function
-            )
-            self.language[cid] = language.get(cid, "EN") if language else "EN"
+        client = get_chroma_client()
+        for collection_id in collection_record_ids:
+            try:
+                self.vector_stores[collection_id] = client.get_collection(
+                    collection_id, embedding_function=self.embedding_function
+                )
+            except NotFoundError:
+                continue
 
     @classmethod
     def ingest(
         cls,
         documents: list[Document],
         collection_record_id: str,
-        embedding_function: EmbeddingFunction = SyncEmbeddingFunction(),
+        embedding_function: EmbeddingFunction | None = None,
         **_: dict,
     ):
+        if not documents:
+            return
         if collection_record_id is None:
             collection_record_id = "default_record"
+        if embedding_function is None:
+            embedding_function = SyncEmbeddingFunction()
 
         try:
-            # Chroma 向量化
-            # 分批次传给embedding服务器，太大会导致传输时间太长超时
-            # ids 用于上下文回找，vector_store.get(ids="0")
-            batch_size = 10  # 最大10
-            for i in range(0, len(documents), batch_size):
-                batch = documents[i : i + batch_size]
-                page_contents, metadatas = zip(
-                    *((b.page_content, b.metadata) for b in batch)
+            collection = get_collection(
+                collection_record_id, embedding_function=embedding_function
+            )
+            batch_size = 10
+            for start in range(0, len(documents), batch_size):
+                batch = documents[start : start + batch_size]
+                collection.add(
+                    ids=[doc.id for doc in batch],  # type: ignore
+                    documents=[doc.page_content for doc in batch],
+                    metadatas=[doc.metadata for doc in batch],
                 )
+        except Exception as exc:
+            logger.error("文档向量化失败: %s", collection_record_id, exc_info=exc)
+            raise RuntimeError(f"文档切片或向量化失败: {collection_record_id}") from exc
 
-                vector_store = get_collection(
-                    collection_record_id, embedding_function=embedding_function
-                )
-                vector_store.add(
-                    ids=[b.id for b in batch],  # type: ignore
-                    documents=list(page_contents),
-                    metadatas=list(metadatas),
-                )
-
-        except Exception as e:
-            logger.error(f"文档向量化失败: {collection_record_id}", exc_info=e)
-            raise RuntimeError(f"文档切片或向量化失败: {id}") from e
-
-    # TODO query 中英文 配对
     def retrieve(
-        self, query: dict | str, top_k: int = 10, query_route: dict | None = None
+        self,
+        query: dict | str,
+        top_k: int = 10,
+        query_route: dict[str, int] | None = None,
+        *,
+        skip_empty: bool = False,
     ) -> list[Document]:
-        if len(self.vector_stores) == 0:
-            return []
-
-        if query_route:
-            documents = []
-            for record_id, k in query_route.items():
-                if self.vector_stores[record_id] is not None and k > 0:
-                    if isinstance(query, dict):
-                        doc_language = self.language.get(record_id, "EN")
-                        query = query.get(doc_language, "")
-                    result = self.vector_stores[record_id].query(
-                        query_texts=query, n_results=k  # type: ignore
-                    )
-                    documents.extend(flatten_query_result(result))
-
-        else:
-            results = []
-            for vs in self.vector_stores.values():
-                res = vs.query(
-                    query_texts=[
-                        query.get("EN", "") if isinstance(query, dict) else query
-                    ],
-                    n_results=top_k,
+        results: list[QueryResult] = []
+        embeddings: dict[str, Embeddings] = {}
+        for collection_id, collection in self.vector_stores.items():
+            count = top_k if query_route is None else min(
+                top_k, query_route.get(collection_id, 0)
+            )
+            if count <= 0:
+                continue
+            query_text = query_for_language(query, self.language.get(collection_id, "EN"))
+            try:
+                if skip_empty and collection.count() == 0:
+                    continue
+                if query_text not in embeddings:
+                    embeddings[query_text] = self.embedding_function.embed_query([query_text])
+                result = collection.query(
+                    query_embeddings=embeddings[query_text], n_results=count
                 )
-                results.append(res)
+            except NotFoundError:
+                continue
+            result["metadatas"] = [
+                [{**(metadata or {}), "collection_id": collection_id} for metadata in group]
+                for group in result.get("metadatas") or []
+            ]
+            results.append(result)
 
-            topk_results = get_topk_query_result(results, top_k)
-            documents = [doc for _, doc in topk_results]
-        return documents
+        return [doc for _, doc in get_topk_query_result(results, top_k)]
 
     async def get_by_ids(
         self, record_ids: list[str], ids: list[list[str]]
@@ -126,79 +113,38 @@ class ChromaRetriever:
             raise ValueError("record_ids 和 ids 长度不匹配")
 
         result: dict[str, list[Document]] = {}
-        for rid, id_list in zip(record_ids, ids):
-            collection = self.vector_stores.get(str(rid))
-            if collection is None:
-                result[str(rid)] = []
-                raise ValueError(f"Chroma collection for record_id {rid} not found")
-            else:
-                docs = flatten_query_result(collection.get(ids=id_list))
-                result[str(rid)] = docs
+        for record_id, chunk_ids in zip(record_ids, ids):
+            collection = self.vector_stores.get(record_id)
+            if collection is not None and chunk_ids:
+                try:
+                    chunks = await asyncio.to_thread(collection.get, ids=chunk_ids)
+                except NotFoundError:
+                    continue
+                docs = flatten_query_result(chunks)
+                for doc in docs:
+                    doc.metadata["collection_id"] = record_id
+                result[record_id] = docs
         return result
 
 
-def get_topk_query_result(results: list[QueryResult], k: int):
-    """
-    从多个 QueryResult 中，基于 distances 全局排序，取前 k 条最相关文档。
-    返回一个列表，每项为 (distance, document)
-    """
-
-    merged: list[tuple[float, Document]] = []
-
+def get_topk_query_result(results: list[QueryResult], k: int) -> list[tuple[float, Document]]:
+    merged = []
     for result in results:
-        distances = result.get("distances")
-        documents = result.get("documents")
-        metadatas = result.get("metadatas")
-
-        if distances is None or documents is None or metadatas is None:
-            continue
-
-        # 遍历每个 query 的结果
-        for dist_list, doc_list, meta_list in zip(distances, documents, metadatas):
-            for dist, doc, meta in zip(dist_list, doc_list, meta_list):
-                merged.append((dist, Document(page_content=doc, metadata=meta)))  # type: ignore
-
-    # 按距离升序排序
-    merged.sort(key=lambda x: x[0])
-
-    # 返回 top-k
-    return merged[:k]
+        distances = chain.from_iterable(result.get("distances") or [])
+        merged.extend(zip(distances, flatten_query_result(result)))
+    return sorted(merged, key=lambda pair: pair[0])[:k]
 
 
 def flatten_query_result(result: QueryResult | GetResult) -> list[Document]:
-    """基于 ChromaDB 返回的 QueryResult 或 GetResult，构建 Document 列表"""
-    flat_docs = []
-
-    ids_list = result.get("ids") or []
-    docs_list = result.get("documents") or []
-    metas_list = result.get("metadatas") or []
-
-    # 遍历所有查询结果
+    ids = result.get("ids") or []
+    documents = result.get("documents") or []
+    metadata = result.get("metadatas") or []
     if "distances" in result:
-        # QueryResult 结构
-        for ids, docs, metas in zip(ids_list, docs_list, metas_list):
-            # 遍历一次查询结果中的每个文档
-            for id, doc, meta in zip(ids, docs, metas):
-                if not isinstance(meta, dict):
-                    raise ValueError("Metadata should be a dictionary.")
-                flat_docs.append(
-                    Document(
-                        page_content=doc,
-                        metadata={**meta},
-                        id=id,
-                    )
-                )
-    else:
-        # GetResult 结构
-        for id, doc, meta in zip(ids_list, docs_list, metas_list):
-            if not isinstance(meta, dict):
-                raise ValueError("Metadata should be a dictionary.")
-            flat_docs.append(
-                Document(
-                    page_content=doc,  # type: ignore
-                    metadata={**meta},
-                    id=id,
-                )
-            )
+        ids = chain.from_iterable(ids)
+        documents = chain.from_iterable(documents)
+        metadata = chain.from_iterable(metadata)
 
-    return flat_docs
+    return [
+        Document(id=chunk_id, page_content=content, metadata=chunk_metadata or {})
+        for chunk_id, content, chunk_metadata in zip(ids, documents, metadata)
+    ]

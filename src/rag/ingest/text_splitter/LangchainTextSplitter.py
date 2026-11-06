@@ -9,10 +9,10 @@ class RecursiveTextSplitter:
         self,
         chunk_size: int = 500,
         chunk_overlap: int = 50,
-        speparators: list[str] | None = None,
+        separators: list[str] | None = None,
     ):
         self.splitter = RCTSplitter(
-            chunk_size=chunk_size, chunk_overlap=chunk_overlap, speparators=speparators
+            chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=separators
         )
 
     def split_text(self, text: str) -> list[dict[str, str]]:

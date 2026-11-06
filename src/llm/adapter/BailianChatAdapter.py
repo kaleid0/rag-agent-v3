@@ -11,7 +11,7 @@ from .BaseChatAdapter import BaseChatAdapter, Messages
 
 
 class BailianChatAdapter(BaseChatAdapter):
-    """DeepSeek API 适配器，实现 sync 与 stream 调用"""
+    """百炼对话适配器，支持同步和流式调用。"""
 
     supports_streaming = True
     supports_async = True  # 如果要加 async 可扩展
@@ -23,7 +23,7 @@ class BailianChatAdapter(BaseChatAdapter):
         self.api_key = api_key or os.getenv("BAILIAN_API_KEY")
         if not self.api_key:
             raise ValueError(
-                "DeepSeek API key is missing. Set DEEPSEEK_API_KEY environment variable."
+                "Bailian API key is missing. Set BAILIAN_API_KEY environment variable."
             )
         self.client = OpenAI(
             api_key=self.api_key,
@@ -133,31 +133,21 @@ class BailianChatAdapter(BaseChatAdapter):
         """异步流式接口：逐段返回"""
 
         async def _stream():
-            # if format:
-            #     add_assistant_prefix(messages, "```" + format)
-
-            try:
-                # 使用 async_client 的 chat.completions.create 方法，设置 stream=True
-                stream = await self.async_client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,  # type: ignore
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stream=True,  # 开启流式输出
-                )
-
+            stream = await self.async_client.chat.completions.create(
+                model=self.model,
+                messages=messages,  # type: ignore
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+            async with stream:
                 async for chunk in stream:
-                    # 检查是否有内容片段
                     if (
                         chunk.choices
                         and chunk.choices[0].delta
                         and chunk.choices[0].delta.content
                     ):
                         yield chunk.choices[0].delta.content
-
-            except Exception as e:
-                # 实际应用中，您可能需要更详细的错误处理和日志记录
-                raise e
 
         return _stream()
 

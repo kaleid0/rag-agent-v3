@@ -1,16 +1,65 @@
 import asyncio
-import os
+import logging
+from pathlib import Path
 
+from beanie import PydanticObjectId
 from beanie.odm.operators.update.general import Set
-from beanie.operators import In
-
-from src.database import get_collection
-from .odm.KnowledgeBase import KnowledgeBase
-from .odm.CollectionRecord import CollectionRecord
-from src.rag.ingest.ingest import ingest_file
-from src.document import DocumentRecord
+from beanie.odm.queries.update import UpdateResponse
+from bson.errors import InvalidId
+from chromadb.errors import NotFoundError
+from fastapi import HTTPException
+from pymongo.errors import DuplicateKeyError
 
 from config import rag_cfg
+from src.database import delete_collection
+from src.document import DocumentRecord
+from src.rag.ingest.ingest import ingest_file
+
+from .odm.CollectionRecord import CollectionRecord
+from .odm.KnowledgeBase import KnowledgeBase
+
+
+logger = logging.getLogger(__name__)
+
+_READY_FILTER = {
+    "status": {"$in": ["ready", None]},
+    "chunk_path": {"$type": "string", "$ne": ""},
+    "num_chunks": {"$gt": 0},
+}
+
+
+async def _ready_associations(where: dict) -> list[CollectionRecord]:
+    records = await CollectionRecord.find(where, _READY_FILTER).to_list()
+    return [
+        record
+        for record in records
+        if record.status == "ready" or Path(record.chunk_path).is_file()
+    ]
+
+
+def _object_id(value: str) -> PydanticObjectId:
+    try:
+        return PydanticObjectId(value)
+    except (InvalidId, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid resource ID") from exc
+
+
+async def get_knowledge_base(knowledge_base_id: str) -> KnowledgeBase:
+    knowledge_base = await KnowledgeBase.get(_object_id(knowledge_base_id))
+    if knowledge_base is None:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+    if knowledge_base.deleting:
+        raise HTTPException(status_code=409, detail="Knowledge base is being deleted")
+    return knowledge_base
+
+
+async def _get_document_for_indexing(document_record_id: str) -> DocumentRecord:
+    document = await DocumentRecord.get(_object_id(document_record_id))
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document record not found")
+    if document.parse_status != "ready" or not document.markdown_path:
+        raise HTTPException(status_code=409, detail="Document is not ready to index")
+    return document
 
 
 async def create_knowledge_base(
@@ -22,16 +71,10 @@ async def create_knowledge_base(
     retriever_type: str = "hybrid",
     document_record_ids: list[str] | None = None,
 ) -> KnowledgeBase:
-    """创建一个新的知识库。
+    document_record_ids = list(dict.fromkeys(document_record_ids or []))
+    for document_id in document_record_ids:
+        await _get_document_for_indexing(document_id)
 
-    Args:
-        name (str): 知识库名称，必须唯一。
-        description (str, optional): 知识库描述. Defaults to "".
-        document_record_ids (Optional[list[str]], optional): 关联的文件记录ID列表. Defaults to None.
-
-    Returns:
-        KnowledgeBase: 创建的知识库对象。
-    """
     knowledge_base = KnowledgeBase(
         name=name,
         description=description,
@@ -40,137 +83,195 @@ async def create_knowledge_base(
         split_method=split_method,
         retriever_type=retriever_type,
     )
-
-    task = []
-    for record_id in document_record_ids or []:
-        document_record = await DocumentRecord.get(record_id)
-        if not document_record:
-            raise ValueError(f"Document record with ID {record_id} not found")
-
-        # TODO 解析任务，创建 CollectionRecord 等
-        raise NotImplementedError(
-            "Ingest task not implemented in create_knowledge_base"
-        )
-
     await knowledge_base.insert()
+
+    try:
+        for document_id in document_record_ids:
+            await add_record_to_knowledge_base(str(knowledge_base.id), document_id)
+    except (Exception, asyncio.CancelledError):
+        try:
+            await delete_knowledge_base(str(knowledge_base.id))
+        except Exception:
+            logger.exception("Could not roll back knowledge base %s", knowledge_base.id)
+        raise
     return knowledge_base
+
+
+def _cleanup_association_artifacts(record: CollectionRecord) -> None:
+    if record.retriever_type != "sparse":
+        try:
+            delete_collection(str(record.id))
+        except NotFoundError:
+            pass
+
+    chunk_path = record.chunk_path or str(
+        Path(rag_cfg["chunk_dir"]) / f"{record.id}.pkl"
+    )
+    Path(chunk_path).unlink(missing_ok=True)
+
+
+async def _delete_association(record: CollectionRecord) -> None:
+    deleting = await CollectionRecord.find_one(
+        {"_id": record.id, "status": {"$ne": "indexing"}}
+    ).update(Set({"status": "deleting"}), response_type=UpdateResponse.NEW_DOCUMENT)
+    if deleting is None:
+        if await CollectionRecord.get(record.id) is not None:
+            raise HTTPException(status_code=409, detail="Document is being indexed")
+        return
+
+    await asyncio.to_thread(_cleanup_association_artifacts, deleting)
+    await deleting.delete()
+
+
+async def delete_associations(records: list[CollectionRecord]) -> None:
+    if any(record.status == "indexing" for record in records):
+        raise HTTPException(status_code=409, detail="Document is being indexed")
+    for record in records:
+        await _delete_association(record)
 
 
 async def remove_record_from_knowledge_base(
     knowledge_base_id: str, collection_record_id: str
 ):
-    """从知识库中移除一个 collection 记录。
-
-    Args:
-        knowledge_base_id (str): 知识库ID。
-        collection_record_id (str): 文件记录ID。
-    """
-    knowledge_base = await KnowledgeBase.get(knowledge_base_id)
-    if not knowledge_base:
-        raise ValueError("Knowledge base not found")
-
-    collection_record = await CollectionRecord.get(collection_record_id)
-    if not collection_record:
-        raise ValueError("Document record not found")
-
-    # 清理相关内容（chunk，chromadb记录），已在 CollectionRecord 的删除钩子中处理
-    collection_record.delete()
+    knowledge_base_id = str(_object_id(knowledge_base_id))
+    file_id = _object_id(collection_record_id)
+    association = await CollectionRecord.get(file_id)
+    if association is not None:
+        if association.knowledge_base_id != knowledge_base_id:
+            raise HTTPException(status_code=404, detail="Document is not in this knowledge base")
+        records = [association]
+    else:
+        # Accept document IDs from the public API in addition to legacy association IDs.
+        records = await CollectionRecord.find(
+            {"knowledge_base_id": knowledge_base_id, "document_record_id": str(file_id)}
+        ).to_list()
+    await delete_associations(records)
 
 
-async def add_record_to_knowledge_base(knowledge_base_id: str, document_record_id: str):
-    """向知识库中添加一个文件记录。
+async def _build_association(record: CollectionRecord, retry: bool) -> None:
+    try:
+        knowledge_base = await get_knowledge_base(record.knowledge_base_id)
+        document = await _get_document_for_indexing(record.document_record_id)
+        if retry:
+            await asyncio.to_thread(_cleanup_association_artifacts, record)
+        result = await asyncio.to_thread(
+            ingest_file,
+            str(record.id),
+            document.markdown_path,
+            record.chunk_path,
+            document.title or document.source,
+            knowledge_base.chunk_size,
+            knowledge_base.chunk_overlap,
+            knowledge_base.split_method,
+            knowledge_base.retriever_type,
+        )
+        if result.num_chunks == 0:
+            raise HTTPException(status_code=422, detail="Document has no indexable content")
 
-    Args:
-        knowledge_base_id (str): 知识库ID。
-        record_id (str): 文件记录ID。
-    """
-    knowledge_base = await KnowledgeBase.get(knowledge_base_id)
-    if not knowledge_base:
-        raise ValueError("Knowledge base not found")
-    document_record = await DocumentRecord.get(document_record_id)
-    if not document_record:
-        raise ValueError("Document record not found")
-    if not document_record.markdown_path:
-        raise ValueError("Document record has not been parsed yet")
+        await get_knowledge_base(record.knowledge_base_id)
+        await _get_document_for_indexing(record.document_record_id)
+        await record.set({"status": "ready", "num_chunks": result.num_chunks})
+    except Exception as exc:
+        try:
+            await asyncio.to_thread(_cleanup_association_artifacts, record)
+        except Exception:
+            logger.exception("Could not clean incomplete index %s", record.id)
 
-    collection_record = CollectionRecord(
-        knowledge_base_id=knowledge_base_id,
-        document_record_id=document_record_id,
+        await record.set({"status": "failed", "num_chunks": 0})
+        if isinstance(exc, HTTPException) and exc.status_code == 404:
+            # A parent can disappear after the initial read and before this claim.
+            await _delete_association(record)
+        raise
+
+
+async def add_record_to_knowledge_base(
+    knowledge_base_id: str, document_record_id: str
+) -> None:
+    knowledge_base = await get_knowledge_base(knowledge_base_id)
+    document = await _get_document_for_indexing(document_record_id)
+    knowledge_base_id = str(knowledge_base.id)
+    document_record_id = str(document.id)
+    pair = {
+        "knowledge_base_id": knowledge_base_id,
+        "document_record_id": document_record_id,
+    }
+
+    if await _ready_associations(pair):
+        return
+
+    association_key = f"{knowledge_base_id}:{document_record_id}"
+    association_id = PydanticObjectId()
+    pending = CollectionRecord(
+        id=association_id,
+        association_key=association_key,
+        status="pending",
+        chunk_path=str(Path(rag_cfg["chunk_dir"]) / f"{association_id}.pkl"),
+        retriever_type=knowledge_base.retriever_type,
+        **pair,
     )
-    await collection_record.insert()
+    try:
+        await pending.insert()
+    except DuplicateKeyError:
+        # A concurrent request already reserved this pair.
+        pass
 
-    chunk_save_path = os.path.join(
-        rag_cfg["chunk_dir"], str(collection_record.id) + ".pkl"
-    )
+    retry = await CollectionRecord.find_one(
+        {"association_key": association_key, "status": "failed"}
+    ).update(Set({"status": "indexing"}), response_type=UpdateResponse.NEW_DOCUMENT)
+    record = retry
+    if record is None:
+        record = await CollectionRecord.find_one(
+            {"association_key": association_key, "status": "pending"}
+        ).update(Set({"status": "indexing"}), response_type=UpdateResponse.NEW_DOCUMENT)
 
-    ingest_result = await asyncio.to_thread(
-        ingest_file,
-        str(collection_record.id),
-        document_record.markdown_path,
-        chunk_save_path,
-        document_record.title,  # type: ignore
-        knowledge_base.chunk_size,
-        knowledge_base.chunk_overlap,
-        knowledge_base.split_method,
-        knowledge_base.retriever_type,
-    )
-    collection_record.chunk_path = chunk_save_path
-    collection_record.num_chunks = ingest_result.num_chunks
+    if record is None:
+        if await _ready_associations(pair):
+            return
+        raise HTTPException(status_code=409, detail="Document indexing or removal is in progress")
 
-    await collection_record.save_changes()
+    task = asyncio.create_task(_build_association(record, retry=retry is not None))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # Cancelling the request cannot stop the worker thread. Keep the claim until it finishes.
+        try:
+            await asyncio.shield(task)
+        except Exception:
+            logger.exception("Indexing failed after cancellation for %s", record.id)
+        raise
 
 
 async def delete_knowledge_base(knowledge_base_id: str):
-    """删除一个知识库。
-
-    Args:
-        knowledge_base_id (str): 知识库ID。
-    """
-    knowledge_base = await KnowledgeBase.get(knowledge_base_id)
-    if not knowledge_base:
-        raise ValueError("Knowledge base not found")
-
-    if knowledge_base.retriever_type in ["vector", "hybrid"]:
-        # 删除相关 向量库
-        collection_records = await CollectionRecord.find(
-            CollectionRecord.knowledge_base_id == knowledge_base_id
-        ).to_list()
-        for collection_record in collection_records:
-            collection = get_collection(name=str(collection_record.id))
-            collection.delete()
-
-    await CollectionRecord.find(
-        CollectionRecord.knowledge_base_id == knowledge_base_id
-    ).delete()
-
-    await knowledge_base.delete()
+    knowledge_base_id = _object_id(knowledge_base_id)
+    knowledge_base = await KnowledgeBase.find_one({"_id": knowledge_base_id}).update(
+        Set({"deleting": True}), response_type=UpdateResponse.NEW_DOCUMENT
+    )
+    records = await get_collections_in_knowledge_base(
+        str(knowledge_base_id), ready_only=False
+    )
+    await delete_associations(records)
+    if knowledge_base is not None:
+        await knowledge_base.delete()
 
 
 async def list_knowledge_bases(skip: int = 0, limit: int = 100) -> list[KnowledgeBase]:
-    """列出所有知识库。
-
-    Returns:
-        list[KnowledgeBase]: 知识库列表。
-    """
-    knowledge_bases = await KnowledgeBase.find_all(skip, limit).to_list()
-    return knowledge_bases
+    return await KnowledgeBase.find_all(skip=skip, limit=limit).to_list()
 
 
 async def get_collections_in_knowledge_base(
-    knowledge_base_id: str | list[str],
+    knowledge_base_id: str | list[str], *, ready_only: bool = True
 ) -> list[CollectionRecord]:
-    """获取知识库中的所有 collection 记录。
+    """Return readable associations by default, including compatible legacy rows."""
+    ids = [knowledge_base_id] if isinstance(knowledge_base_id, str) else knowledge_base_id
+    if not ids:
+        return []
 
-    Args:
-        knowledge_base_id (str): 知识库ID。
+    if not ready_only:
+        return await CollectionRecord.find({"knowledge_base_id": {"$in": ids}}).to_list()
 
-    Returns:
-        list[CollectionRecord]: collection 记录列表。
-    """
-    if isinstance(knowledge_base_id, str):
-        knowledge_base_id = [knowledge_base_id]
-
-    collections = await CollectionRecord.find(
-        In(CollectionRecord.knowledge_base_id, knowledge_base_id)
+    active = await KnowledgeBase.find(
+        {"_id": {"$in": [_object_id(id_) for id_ in ids]}, "deleting": {"$ne": True}}
     ).to_list()
-    return collections
+    return await _ready_associations(
+        {"knowledge_base_id": {"$in": [str(kb.id) for kb in active]}}
+    )

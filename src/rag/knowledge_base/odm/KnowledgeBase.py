@@ -10,8 +10,9 @@ from src.database import BaseDocument
 class KnowledgeBase(BaseDocument):
     """存储知识库信息"""
 
-    name: str = Field(..., unique=True)  # type: ignore # 知识库名称，唯一
+    name: str
     description: str = Field(default="")  # 知识库描述
+    deleting: bool = False
 
     chunk_size: int = Field(default=300)  # 知识库文本块大小
     chunk_overlap: int = Field(default=50)  # 知识库文本块重叠大小

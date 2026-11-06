@@ -1,7 +1,7 @@
 """API 请求和响应的 Pydantic 模型"""
 
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any, Literal, Self
+from pydantic import BaseModel, Field, model_validator
 from datetime import datetime
 
 
@@ -96,13 +96,25 @@ class DocumentListResponse(BaseModel):
 class KnowledgeBaseCreateRequest(BaseModel):
     """创建知识库请求"""
 
-    name: str = Field(..., description="知识库名称")
+    name: str = Field(..., min_length=1, description="知识库名称")
     description: str = Field(default="", description="知识库描述")
-    chunk_size: int = Field(default=500, description="文本块大小")
-    chunk_overlap: int = Field(default=50, description="文本块重叠大小")
-    split_method: str = Field(default="recursive", description="文本拆分方法")
-    retriever_type: str = Field(default="hybrid", description="检索器类型")
+    chunk_size: int = Field(default=500, gt=0, description="文本块大小")
+    chunk_overlap: int = Field(default=50, ge=0, description="文本块重叠大小")
+    split_method: Literal["character", "recursive", "hierarchical"] = Field(
+        default="recursive", description="文本拆分方法"
+    )
+    retriever_type: Literal["vector", "sparse", "hybrid"] = Field(
+        default="hybrid", description="检索器类型"
+    )
     record_ids: List[str] = Field(default_factory=list, description="文件记录ID列表")
+
+    @model_validator(mode="after")
+    def validate_knowledge_base(self) -> Self:
+        if not self.name.strip():
+            raise ValueError("知识库名称不能为空")
+        if self.split_method != "hierarchical" and self.chunk_overlap >= self.chunk_size:
+            raise ValueError("文本块重叠大小必须小于文本块大小")
+        return self
 
 
 class KnowledgeBaseResponse(BaseModel):

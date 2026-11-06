@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from pydantic import Field, PrivateAttr
 from pymongo import ASCENDING, DESCENDING
 
@@ -31,6 +33,27 @@ class Session(BaseDocument):
             "user_id",
         ]
         use_state_management = True
+
+    async def append_turn(
+        self, user_message: DialogMessage, assistant_message: DialogMessage
+    ) -> bool:
+        result = await self.get_pymongo_collection().update_one(
+            {"_id": self.id},
+            {
+                "$push": {
+                    "dialog_messages": {
+                        "$each": [
+                            user_message.model_dump(),
+                            assistant_message.model_dump(),
+                        ]
+                    }
+                },
+                "$inc": {"message_count": 2},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+            upsert=False,
+        )
+        return result.matched_count == 1
 
     def get_history(
         self,

@@ -8,7 +8,7 @@ dependencies = [
     "uvicorn>=0.38.0",
     "fastapi>=0.124.0",
     "beanie>=2.0.1",
-    "motor>=3.7.1",
+    "pymongo>=4.15.5",
     "chromadb>=1.3.5",
     "openai>=2.9.0",
     "langchain-core>=1.1.1",
@@ -35,7 +35,7 @@ include = ["src", "src.*"]
 
 [tool.mongo]
 uri = "mongodb://localhost:27017"
-db_name = "rag_agent_v2_database"
+database = "rag_agent"
 
 
 [tool.chroma]
@@ -65,7 +65,7 @@ split_method = "hierarchical"                # character, recursive, hierarchica
 llm_provider = "bailian" # deepseek, bailian
 llm_model = "qwen-plus" # qwen-plus, deepseek-chat
 embedding_provider = "bailian"
-embedding_model = "text-embedding-ada-002"
+embedding_model = "text-embedding-v4"
 
 # 检索配置
 top_k = 5
@@ -85,6 +85,8 @@ do_cell_matching = true
 
 [tool.memory]
 # rag 配置
+retrieve_enabled = false
+retrieve_timeout_seconds = 1.0
 split_method = "character"        # character, recursive, hierarchical
 max_chunk_size = 300
 retriever_type = "vector"

@@ -127,29 +127,22 @@ class DeepseekChatAdapter(BaseChatAdapter):
             if format:
                 add_assistant_prefix(messages, "```" + format)
 
-            try:
-                # 使用 async_client 的 chat.completions.create 方法，设置 stream=True
-                stream = await self.async_client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,  # type: ignore
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stop="```" if format else None,
-                    stream=True,  # 开启流式输出
-                )
-
+            stream = await self.async_client.chat.completions.create(
+                model=self.model,
+                messages=messages,  # type: ignore
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop="```" if format else None,
+                stream=True,
+            )
+            async with stream:
                 async for chunk in stream:
-                    # 检查是否有内容片段
                     if (
                         chunk.choices
                         and chunk.choices[0].delta
                         and chunk.choices[0].delta.content
                     ):
                         yield chunk.choices[0].delta.content
-
-            except Exception as e:
-                # 实际应用中，您可能需要更详细的错误处理和日志记录
-                raise e
 
         return _stream()
 

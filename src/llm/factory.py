@@ -21,7 +21,7 @@ def get_llm(
             raise NotImplementedError("OpenAI adapter not added yet")
         elif llm_provider == "bailian":
             _instances[key] = BailianChatAdapter(
-                api_key=api_key, model=model or "deepseek-chat"
+                api_key=api_key, model=model or "qwen-plus"
             )
         else:
             raise ValueError(f"Unknown LLM provider name: {llm_provider}")

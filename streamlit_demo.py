@@ -5,6 +5,7 @@
 """
 
 import json
+from itertools import chain
 import streamlit as st
 import requests
 from typing import Optional
@@ -36,12 +37,32 @@ def create_session(user_id: str) -> Optional[str]:
         return None
 
 
-def delete_session_if_blank(session_id: str) -> None:
-    """如果会话为空，则删除之"""
+def exit_session(session_id: str) -> None:
+    """退出当前会话，保留有消息的会话。"""
     try:
-        requests.post(f"{API_BASE_URL}/api/v1/sessions/{session_id}/exit")
-    except Exception:
-        pass
+        response = requests.post(
+            f"{API_BASE_URL}/api/v1/sessions/{session_id}/exit", timeout=5
+        )
+        if response.status_code != 404:
+            response.raise_for_status()
+    except requests.RequestException as exc:
+        st.warning(f"退出会话失败: {exc}")
+
+
+def list_all_sessions(user_id: str) -> list[dict]:
+    sessions = []
+    page_size = 100
+    while True:
+        response = requests.get(
+            f"{API_BASE_URL}/api/v1/session-list",
+            params={"user_id": user_id, "offset": len(sessions), "limit": page_size},
+            timeout=5,
+        )
+        response.raise_for_status()
+        page = response.json()
+        sessions.extend(page)
+        if len(page) < page_size:
+            return sessions
 
 
 def send_message(
@@ -63,22 +84,19 @@ def send_message(
 
 def send_message_stream(session_id: str, content: str, kb_id: Optional[str] = None):
     """使用流式接口发送消息并返回流响应的迭代器"""
-    try:
-        payload = {"session_id": session_id, "content": content}
-        if kb_id:
-            payload["knowledge_base_id"] = kb_id
+    payload = {"session_id": session_id, "content": content}
+    if kb_id:
+        payload["knowledge_base_id"] = kb_id
 
-        # 使用 stream=True 来逐步读取响应
-        resp = requests.post(
-            f"{API_BASE_URL}/api/v1/chat-stream", json=payload, stream=True
-        )
+    with requests.post(
+        f"{API_BASE_URL}/api/v1/chat-stream",
+        json=payload,
+        stream=True,
+        timeout=(5, 120),
+    ) as resp:
         resp.raise_for_status()
-        # 逐行/逐块迭代文本流
-        for chunk in resp.iter_content(chunk_size=None):
-            if chunk:
-                yield chunk.decode("utf-8")
-    except Exception as e:
-        yield f"[ERROR]{e}"
+        resp.encoding = "utf-8"
+        yield from resp.iter_content(chunk_size=None, decode_unicode=True)
 
 
 def main():
@@ -181,7 +199,7 @@ def render_chat_page():
         if st.button("➕ 创建新会话", type="tertiary", use_container_width=True):
             # 如果当前有 session_id，尝试退出（若为空会话则后端会删除）
             if st.session_state.session_id:
-                delete_session_if_blank(st.session_state.session_id)
+                exit_session(st.session_state.session_id)
 
             session_id = create_session(st.session_state.user_id)  # type: ignore
             if session_id:
@@ -190,10 +208,7 @@ def render_chat_page():
                 st.rerun()
 
         try:
-            session_list = requests.get(
-                f"{API_BASE_URL}/api/v1/session-list",
-                params={"user_id": st.session_state.user_id},
-            ).json()
+            session_list = list_all_sessions(st.session_state.user_id)
 
             if not session_list:
                 st.info("暂无会话")
@@ -218,12 +233,14 @@ def render_chat_page():
                             st.session_state.session_id
                             and st.session_state.session_id != sess_id
                         ):
-                            delete_session_if_blank(st.session_state.session_id)
+                            exit_session(st.session_state.session_id)
 
+                        response = requests.get(
+                            f"{API_BASE_URL}/api/v1/sessions/{sess_id}", timeout=5
+                        )
+                        response.raise_for_status()
+                        history = response.json()
                         st.session_state.session_id = sess_id
-                        history = requests.get(
-                            f"{API_BASE_URL}/api/v1/sessions/{sess_id}"
-                        ).json()
                         st.session_state.messages = [
                             {
                                 "role": (
@@ -254,31 +271,23 @@ def render_chat_page():
         # 显示用户消息
         with st.chat_message("user"):
             st.markdown(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt})
-
         # 获取助手回复（流式）
         with st.chat_message("assistant"):
             # 知识库
             selected_kb_name = st.session_state[f"kb_selector"]
-            if selected_kb_name == "不使用知识库":
-                selected_id = None
-            else:
-                for kn in kb_list:
-                    if kn.get("name", "未命名知识库") == selected_kb_name:
-                        selected_id = kn.get("id", None)
-                        break
+            selected_id = None
+            if selected_kb_name != "不使用知识库":
+                selected_id = next(
+                    (
+                        kb.get("id")
+                        for kb in kb_list
+                        if kb.get("name", "未命名知识库") == selected_kb_name
+                    ),
+                    None,
+                )
 
             placeholder = st.empty()
             full_text = ""
-
-            # 显示思考中动画
-            with placeholder.container():
-                with st.spinner("思考中..."):
-                    # 获取第一个数据块
-                    stream_generator = send_message_stream(
-                        st.session_state.session_id, prompt, selected_id
-                    )
-                    first_chunk = next(stream_generator, None)
 
             # 检查是否有未闭合的公式标记
             def has_unclosed_formula(text):
@@ -290,49 +299,29 @@ def render_chat_page():
                 double_dollar_count = text.count("$$")
                 return (single_dollar_count % 2 != 0) or (double_dollar_count % 2 != 0)
 
-            # 处理响应
-            if first_chunk:
-                if first_chunk.startswith("[ERROR]"):
-                    placeholder.error(first_chunk.replace("[ERROR]", ""))
-                else:
-                    full_text = first_chunk
-                    buffer = ""  # 缓冲区用于处理不完整的公式
+            try:
+                with placeholder.container():
+                    with st.spinner("思考中..."):
+                        stream = send_message_stream(
+                            st.session_state.session_id, prompt, selected_id
+                        )
+                        first_chunk = next(stream, "")
 
-                    # 显示初始内容
+                for chunk in chain((first_chunk,), stream):
+                    full_text += chunk
                     if not has_unclosed_formula(full_text):
                         placeholder.markdown(full_text)
-                    else:
-                        buffer = full_text
-
-                    # 继续处理剩余的流数据
-                    for chunk in stream_generator:
-                        if chunk.startswith("[ERROR]"):
-                            placeholder.error(chunk.replace("[ERROR]", ""))
-                            break
-
-                        full_text += chunk
-
-                        # 如果有缓冲内容，先累积
-                        if buffer:
-                            buffer += chunk
-                            # 检查缓冲区是否包含完整公式
-                            if not has_unclosed_formula(buffer):
-                                placeholder.markdown(full_text)
-                                buffer = ""
-                        else:
-                            # 检查是否导致公式不完整
-                            if not has_unclosed_formula(full_text):
-                                placeholder.markdown(full_text)
-                            else:
-                                buffer = chunk
-
-                    # 确保最后显示完整内容
-                    if full_text:
-                        placeholder.markdown(full_text)
+            except requests.RequestException as exc:
+                placeholder.error(f"回复中断: {exc}")
+                return
 
             if full_text:
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": full_text}
+                placeholder.markdown(full_text)
+                st.session_state.messages.extend(
+                    [
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": full_text},
+                    ]
                 )
 
 
@@ -489,10 +478,7 @@ def render_session_manage_page():
 
     # 获取会话列表
     try:
-        session_list = requests.get(
-            f"{API_BASE_URL}/api/v1/session-list",
-            params={"user_id": user_id},
-        ).json()
+        session_list = list_all_sessions(user_id)
     except Exception as e:
         st.error(f"获取会话列表失败: {e}")
         session_list = []
@@ -537,13 +523,15 @@ def render_session_manage_page():
                 if cols[1].button("切换聊天", key=f"switch_sess_{sess_id}"):
                     if st.session_state.session_id != sess_id:
                         if st.session_state.session_id:
-                            delete_session_if_blank(st.session_state.session_id)
+                            exit_session(st.session_state.session_id)
 
-                        st.session_state.session_id = sess_id
                         try:
-                            history = requests.get(
-                                f"{API_BASE_URL}/api/v1/sessions/{sess_id}"
-                            ).json()
+                            response = requests.get(
+                                f"{API_BASE_URL}/api/v1/sessions/{sess_id}", timeout=5
+                            )
+                            response.raise_for_status()
+                            history = response.json()
+                            st.session_state.session_id = sess_id
                             st.session_state.messages = [
                                 {
                                     "role": (
@@ -567,8 +555,8 @@ def render_session_manage_page():
                     "删除", key=f"delete_sess_{sess_id}", type="secondary"
                 ):
                     try:
-                        resp = requests.post(
-                            f"{API_BASE_URL}/api/v1/sessions/{sess_id}/exit"
+                        resp = requests.delete(
+                            f"{API_BASE_URL}/api/v1/sessions/{sess_id}", timeout=30
                         )
                         resp.raise_for_status()
                         st.success(f"已删除会话: {title}")
@@ -605,13 +593,23 @@ def render_document_manage_page():
             doc_title = metadata.get("title") or doc.get("source", "未命名文档")
             doc_summary = metadata.get("abstract", "无摘要")
             doc_keywords = metadata.get("keywords", [])
+            status = metadata.get("status")
 
             with st.expander(f"📄 {doc_title}", expanded=False):
-                if metadata.get("title"):
+                if status == "ready" or (
+                    status is None and (metadata.get("is_prased") or metadata.get("title"))
+                ):
                     st.write(f"**摘要:** {doc_summary}")
                     st.write(f"**关键词:** {doc_keywords}")
+                elif status == "failed":
+                    st.error(metadata.get("error") or "文档解析失败")
+                    st.caption("重新上传同一文件可重试解析。")
+                elif status == "deleting":
+                    st.info("正在删除")
+                elif status == "pending":
+                    st.info("等待解析")
                 else:
-                    st.spinner("解析中")
+                    st.info("正在解析")
 
                 if st.button("删除文档", key=f"del_doc_{doc_id}", type="secondary"):
                     try:

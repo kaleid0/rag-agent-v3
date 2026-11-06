@@ -1,11 +1,9 @@
-import os
-import shutil
+from typing import Literal
 
-from beanie import Delete, before_event
 from pydantic import Field
-from pymongo import DESCENDING, ASCENDING
+from pymongo import ASCENDING, DESCENDING, IndexModel
 
-from src.database import BaseDocument, delete_collection
+from src.database import BaseDocument
 
 
 # 数据库设计
@@ -19,26 +17,25 @@ class CollectionRecord(BaseDocument):
 
     document_record_id: str = Field(...)  # 关联的文档记录ID
     knowledge_base_id: str = Field(...)  # 关联的知识库ID
+    status: Literal["pending", "indexing", "ready", "failed", "deleting"] | None = None
+    # New reservations opt into uniqueness without rewriting existing associations.
+    association_key: str | None = None
+    retriever_type: Literal["vector", "sparse", "hybrid"] | None = None
 
     class Settings:
         name = "collection_record"  # MongoDB 集合名
         indexes = [
             [("created_at", DESCENDING)],  # 单字段索引 (列表格式)
-            # **唯一复合索引：** 复合字段列表 + 选项字典
             [
                 ("document_record_id", ASCENDING),  # 字段 1
                 ("knowledge_base_id", ASCENDING),  # 字段 2
             ],
             [("knowledge_base_id", ASCENDING)],
             [("document_record_id", ASCENDING)],
+            IndexModel(
+                [("association_key", ASCENDING)],
+                unique=True,
+                partialFilterExpression={"association_key": {"$type": "string"}},
+            ),
         ]
         use_state_management = True
-
-    @before_event([Delete])
-    async def clean_up_chunks(self):
-        if os.path.exists(self.chunk_path):
-            shutil.rmtree(self.chunk_path)
-
-    @before_event([Delete])
-    async def clean_up_chroma(self):
-        delete_collection(str(self.id))

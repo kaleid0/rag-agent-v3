@@ -1,5 +1,11 @@
+import asyncio
+import logging
 import os
-from typing import Protocol
+from collections.abc import Callable
+from pathlib import PureWindowsPath
+
+from bson import ObjectId
+from chromadb.errors import NotFoundError
 
 # from llm.Message import Messages
 from .LongTermMemory import LongTermMemory
@@ -10,20 +16,44 @@ from src.rag import ingest_memory, RetrievePipelineProtocol
 from src.database import delete_content_from_collection
 from config import memory_cfg
 
-# from .llm_call import memory_merge, memory_summary
+logger = logging.getLogger(__name__)
+
+
+def _memory_user_id(session: Session) -> str | None:
+    user_id = session.user_id
+    # User IDs name both a local pickle and a Chroma collection. Document collections use ObjectIds.
+    if (
+        not user_id
+        or user_id in {".", ".."}
+        or any(ord(char) < 32 or char in '<>:"/\\|?*' for char in user_id)
+        or PureWindowsPath(f"{user_id}.pkl").is_reserved()
+        or ObjectId.is_valid(user_id)
+    ):
+        return None
+    return user_id
 
 
 class MemoryManager:
 
     def __init__(
         self,
-        llm_adapter: BaseChatAdapter,
+        llm_adapter: BaseChatAdapter | Callable[[], BaseChatAdapter],
         short_term_memory_period: int = 10,
         retrieve_pipeline: RetrievePipelineProtocol | None = None,
+        *,
+        retrieve_enabled: bool = False,
+        retrieve_timeout_seconds: float = 1.0,
     ) -> None:
-        self.llm_adapter = llm_adapter
+        self._llm_adapter = llm_adapter
         self.short_term_memory_period = short_term_memory_period
         self.retrieve_pipeline = retrieve_pipeline
+        self.retrieve_enabled = retrieve_enabled
+        self.retrieve_timeout_seconds = retrieve_timeout_seconds
+
+    @property
+    def llm_adapter(self) -> BaseChatAdapter:
+        adapter = self._llm_adapter
+        return adapter() if callable(adapter) else adapter
 
     def should_update_short_term_memory(self, session: Session) -> bool:
         return (
@@ -82,36 +112,56 @@ class MemoryManager:
         session.set_long_term_memory(new_memory)
 
     async def ingest_memory_to_rag(self, session: Session):
-        if session.user_id is None:
+        user_id = _memory_user_id(session)
+        if user_id is None:
             return
         history = session.get_history()
-        chunk_save_path = os.path.join(
-            memory_cfg["chunk_dir"], session.user_id + ".pkl"
-        )
-        ingest_memory(
-            user_id=session.user_id,
+        chunk_save_path = os.path.join(memory_cfg["chunk_dir"], user_id + ".pkl")
+        await asyncio.to_thread(
+            ingest_memory,
+            user_id=user_id,
             messages=history,
             chunk_save_path=chunk_save_path,
             session_id=str(session.id),
         )
 
     async def retrieve_memory_from_rag(self, query: str, session: Session) -> str:
-        if not self.retrieve_pipeline or not session.user_id:
+        if not self.retrieve_enabled or not self.retrieve_pipeline:
+            return ""
+        user_id = _memory_user_id(session)
+        if user_id is None:
             return ""
 
-        retrieved_memories = await self.retrieve_pipeline.retrieve_memory(
-            query=query,
-            user_id=session.user_id,
-        )
+        try:
+            retrieved_memories = await asyncio.wait_for(
+                self.retrieve_pipeline.retrieve_memory(query=query, user_id=user_id),
+                timeout=self.retrieve_timeout_seconds,
+            )
+        except TimeoutError:
+            logger.warning("Session memory lookup timed out for session %s", session.id)
+            return ""
+        except Exception:
+            logger.warning(
+                "Session memory lookup failed for session %s", session.id, exc_info=True
+            )
+            return ""
 
         session.set_retrieved_memory(retrieved_memories)
 
         return retrieved_memories
 
-    async def delete_memory_from_rag(self, user_id: str, session: Session):
-        delete_content_from_collection(
-            name=user_id, metadata={"session_id": str(session.id)}
-        )
+    async def delete_memory_from_rag(self, session: Session):
+        user_id = _memory_user_id(session)
+        if user_id is None:
+            return
+        try:
+            await asyncio.to_thread(
+                delete_content_from_collection,
+                name=user_id,
+                metadata={"session_id": str(session.id)},
+            )
+        except NotFoundError:
+            pass
 
     async def memory_assemble(
         self,

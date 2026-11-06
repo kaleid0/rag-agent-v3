@@ -20,7 +20,7 @@ class BailianEmbeddingAdapter(BaseEmbeddingAdapter):
         self.api_key = api_key or os.getenv("BAILIAN_API_KEY")
         if not self.api_key:
             raise ValueError(
-                "DeepSeek API key is missing. Set BAILIAN_API_KEY environment variable."
+                "Bailian embedding API key is missing. Set BAILIAN_API_KEY environment variable."
             )
         self.client = OpenAI(
             api_key=self.api_key,
@@ -40,7 +40,7 @@ class BailianEmbeddingAdapter(BaseEmbeddingAdapter):
         **kwargs,
     ) -> Embeddings:
         completion = self.client.embeddings.create(
-            model="text-embedding-v4",
+            model=self.model,
             input=input,
             dimensions=dimensions,
             encoding_format=encoding_format,
@@ -60,7 +60,7 @@ class BailianEmbeddingAdapter(BaseEmbeddingAdapter):
         encoding_format: Omit | Literal["float", "base64"] = "float",
     ) -> Embeddings:
         completion = await self.async_client.embeddings.create(
-            model="text-embedding-v4",
+            model=self.model,
             input=input,
             dimensions=dimensions,
             encoding_format=encoding_format,

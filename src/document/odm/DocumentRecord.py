@@ -1,18 +1,9 @@
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import Field
-from pymongo import DESCENDING, ASCENDING
+from pymongo import ASCENDING, DESCENDING, IndexModel
 from beanie import Insert, Delete, Save, SaveChanges, Update, before_event, after_event
 
 from src.database import BaseDocument
-
-
-# class StatusEnum(int, Enum):
-#     pending = 0  # 待处理
-#     parse_completed = 1  # 解析完成
-#     completed = 2  # 向量化完成
-#     failed = -1  # 失败
-
-# 可根据实际情况添加更多状态
 
 
 class DocumentRecord(BaseDocument):
@@ -21,6 +12,9 @@ class DocumentRecord(BaseDocument):
     source: str = Field(default="unknown")  # 文件来源描述
     storage_path: str = Field(...)  # 文件在存储系统中的路径
     file_hash: str = Field(...)
+    # Historical duplicate hashes are preserved and excluded from the unique index.
+    upload_key: str | None = None
+    status: Literal["pending", "processing", "ready", "failed", "deleting"] | None = None
 
     markdown_path: str = Field(default="")  # 转换后的 Markdown 文件路径
     language: str = Field(default="EN", pattern="^(ZH|EN)$")
@@ -31,16 +25,30 @@ class DocumentRecord(BaseDocument):
 
     class Settings:
         name = "document_record"  # MongoDB 集合名
-        indexes = [[("file_hash", ASCENDING)], [("created_at", DESCENDING)]]
+        indexes = [
+            [("file_hash", ASCENDING)],
+            [("created_at", DESCENDING)],
+            IndexModel(
+                [("upload_key", ASCENDING)],
+                unique=True,
+                partialFilterExpression={"upload_key": {"$type": "string"}},
+            ),
+        ]
         use_state_management = True
 
     def __str__(self) -> str:
         return f"DocumentRecord(id={self.id}, title={self.title})"
 
     @property
+    def parse_status(self) -> str:
+        return self.status or ("ready" if self.markdown_path else "pending")
+
+    @property
     def metadata(self) -> dict:
         return {
-            "is_prased": bool(self.markdown_path),
+            "is_prased": self.parse_status == "ready",
+            "status": self.parse_status,
+            "error": "Document parsing failed" if self.status == "failed" else None,
             "language": self.language,
             "title": self.title,
             "abstract": self.abstract,

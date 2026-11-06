@@ -1,17 +1,39 @@
 from langchain_core.documents import Document
 
 
-def remove_duplicates(doucuments: list[Document]) -> list[Document]:
-    """根据 record_id 和 id 去重两个 Document 列表"""
-    seen_contents = set()
-    unique_documents = []
+def query_for_language(query: dict | str, language: str) -> str:
+    if isinstance(query, str):
+        return query
+    return query.get(language) or query.get("EN") or query.get("ZH") or ""
 
-    for doc in doucuments:
-        if (doc.id, doc.metadata.get("record_id")) not in seen_contents:
-            seen_contents.add((doc.id, doc.metadata.get("record_id")))
-            unique_documents.append(doc)
 
-    return unique_documents
+def group_by_collection(documents: list[Document]) -> dict[str, list[Document]]:
+    groups: dict[str, list[Document]] = {}
+    for doc in documents:
+        key = doc.metadata.get("collection_id") or doc.metadata.get("record_id")
+        if not key:
+            key = doc.metadata.get("document_title") or "unknown"
+        groups.setdefault(key, []).append(doc)
+    return groups
+
+
+def remove_duplicates(documents: list[Document]) -> list[Document]:
+    seen = set()
+    unique = []
+    for doc in documents:
+        source_id = (
+            doc.metadata.get("collection_id")
+            or doc.metadata.get("record_id")
+            or doc.metadata.get("session_id")
+        )
+        if source_id is None or doc.id is None:
+            unique.append(doc)
+            continue
+        key = (source_id, doc.id)
+        if key not in seen:
+            seen.add(key)
+            unique.append(doc)
+    return unique
 
 
 def organize_context(documents: dict[str, list[Document]]) -> str:

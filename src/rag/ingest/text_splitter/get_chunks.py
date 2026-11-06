@@ -51,7 +51,7 @@ def _chunking(
         text_splitter = RecursiveTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            speparators=kwargs.get("separators", None),
+            separators=kwargs.get("separators"),
         )
         # -> list[dict] [{'content': '...'}, ...]
 

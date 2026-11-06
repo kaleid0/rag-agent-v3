@@ -26,9 +26,9 @@ format = "json"
 template = "query_route"
 category = "rag"
 custom_input_builder = "query_route"
-input_params = { titles = "titles", keywords = "keywords", question = "question" }
+input_params = { collections = "collections", question = "question" }
 output_parser = "json"
 [query_route.llm_args]
 temperature = 0
-max_tokens = 200
+max_tokens = 1024
 format = "json"
